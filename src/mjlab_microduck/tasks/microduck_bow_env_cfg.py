@@ -1,26 +1,31 @@
-"""Microduck *bow* task — episodic stand → ~45° forward bow, then hold.
+"""Microduck *bow* task — commanded stand ↔ ~45° bow (SitStand recipe).
 
-Single fixed target from t=0 (no waypoints / phase): trunk pitched ~45°
-forward with a BAM-settled leg keyframe. Companion to standup / ball_kick
-style episodic pose-landing policies.
+One policy, both directions, driven by a posture flag in the twist slot:
+    cmd = [bow_flag, 0, 0]   bow_flag ∈ {0 = STAND, 1 = BOW}
+"Stand" is the all-zero command — same deployment idle as every other policy.
+Press Y in ``infer_policy.py --bow ...`` to flip the flag (same path as
+``--sitstand``).
 
-Reset: standing (HOME + noise). Target: BOW keyframe + BOW_Z + forward lean
-``sin(45°)``. Upright rewards are intentionally dropped — they would fight
-the bow. Orientation is tracked via ``pitch_target_*`` on
-``projected_gravity_b[:, 0]``.
+Design:
+  - SitStandCommand slews an internal blend over POSTURE_RAMP_S (anti-jackpot).
+  - posture_* rewards select HOME+STAND_Z vs BOW keyframe+BOW_Z from the blend.
+  - Orientation: upright only when standing; pitch tracking toward sin(45°)
+    when bowing (upright would fight the bow).
+  - Obs 61D: twist carries the flag; head/body slots zero-padded.
 
-Keyframe stability: BAM hold settle 2026-10-01 (walk model). hipΔ=0.65,
-ankle_scale=1.1, kneeΔ=0.40 → tilt ≈ 43° ± 1.5°, lean ≈ 0.68, trunk z ≈ 0.096.
-Reward orientation target is exactly sin(45°) so the last degrees still pull.
-Re-measure BOW_Z / overrides if the robot model or HOME changes.
+Keyframe (BAM settle 2026-10-01): hipΔ=0.65, ankle_scale=1.1, kneeΔ=0.40 →
+tilt ≈ 43°, lean ≈ 0.68, trunk z ≈ 0.096. Orientation target is exact sin(45°).
+
+NOTE: older *episodic-only* bow checkpoints (pre-commanded rewrite) are NOT
+compatible — retrain after this change.
 """
 
 import math
 from copy import deepcopy
 
-ENABLE_SYMMETRY = True  # left/right symmetric bow
+ENABLE_SYMMETRY = True
 
-# ── Domain randomisation (matched to velocity / ball_kick) ───────────────────
+# ── Domain randomisation (matched to velocity / sitstand) ────────────────────
 ENABLE_COM_RANDOMIZATION             = True
 ENABLE_HEAD_COM_RANDOMIZATION        = True
 ENABLE_KP_RANDOMIZATION              = False
@@ -44,27 +49,32 @@ VELOCITY_PUSH_INTERVAL_S            = (3.0, 6.0)
 VELOCITY_PUSH_RANGE                 = (-0.3, 0.3)
 IMU_ORIENTATION_RANDOMIZATION_ANGLE = 6.0
 
-EPISODE_LENGTH_S = 5.0
+# Episode long enough for ≥1 full stand→bow→stand cycle (dwell 3.5–6.5 s).
+EPISODE_LENGTH_S = 12.0
+POSTURE_DWELL_S  = (3.5, 6.5)
+POSTURE_RAMP_S   = 1.5  # slewed target traverse stand↔bow
+BOW_PROB         = 0.5
 
-# BAM-settled bow keyframe (servo joint indices). See module docstring.
+# BAM-settled bow keyframe (servo joint indices).
 BOWING_TARGET_OVERRIDES = {
     2:  -1.1079,  # left  hip_pitch
     3:   0.3951,  # left  knee
     4:   1.1680,  # left  ankle
-    5:   0.6491,  # neck_pitch (slight look-down)
+    5:   0.6491,  # neck_pitch
     6:   0.6491,  # head_pitch
     11:  1.1079,  # right hip_pitch
     12: -0.3951,  # right knee
     13: -1.1680,  # right ankle
 }
 
-_LEG_JOINTS  = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
-_NECK_JOINTS = [5, 6, 7, 8]
-_ALL_SERVO   = _LEG_JOINTS + _NECK_JOINTS
+_LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 
-# Measured settling height under the bow ctrl; orientation target is exact 45°.
+STAND_Z = 0.115
 BOW_Z = 0.096
 TARGET_LEAN = math.sin(math.radians(45))  # ≈ 0.707
+
+MAX_DESCENT_SPEED = 0.08  # m/s downward during the bow
+MAX_RISE_SPEED = 0.10     # m/s upward when returning to stand
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -90,7 +100,7 @@ from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 
 def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-    """Episodic stand → 45° bow environment (flat terrain only)."""
+    """Commanded stand ↔ 45° bow environment (flat terrain)."""
 
     feet_ground_cfg = ContactSensorCfg(
         name="feet_ground_contact",
@@ -105,7 +115,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         num_slots=1,
         track_air_time=True,
     )
-
     self_collision_cfg = ContactSensorCfg(
         name="self_collision",
         primary=ContactMatch(mode="subtree", pattern="trunk_base", entity="robot"),
@@ -114,7 +123,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         reduce="none",
         num_slots=1,
     )
-
     foot_frictions_geom_names = ("left_foot_collision", "right_foot_collision")
 
     cfg = make_velocity_env_cfg()
@@ -136,118 +144,152 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "foot_slip",
         "pose",
         "soft_landing",
-        "upright",  # fights the bow — replaced by pitch_target_*
+        "upright",
     ]:
         if name in cfg.rewards:
             del cfg.rewards[name]
 
-    # ── Task stack: pitch (main) + pose + height + feet + gentle ─────────────
-    # Task mass kept ~velocity (~11) so shared regularisers bite at the same
-    # relative strength (standup ÷4 lesson).
+    # ── Posture-conditioned task stack (sitstand recipe, bow keyframe) ───────
+    cfg.rewards["posture_pose_legs"] = RewardTermCfg(
+        func=microduck_mdp.posture_pose_match,
+        weight=2.0,
+        params={
+            "command_name": "twist",
+            "std": 0.5,
+            "joint_indices": _LEG_JOINTS,
+            "sit_overrides": BOWING_TARGET_OVERRIDES,
+        },
+    )
+    cfg.rewards["posture_pose_l1"] = RewardTermCfg(
+        func=microduck_mdp.posture_pose_l1,
+        weight=1.25,
+        params={
+            "command_name": "twist",
+            "joint_indices": _LEG_JOINTS,
+            "sit_overrides": BOWING_TARGET_OVERRIDES,
+        },
+    )
 
-    cfg.rewards["pitch_bow"] = RewardTermCfg(
-        func=microduck_mdp.pitch_target_gaussian,
+    cfg.rewards["posture_height"] = RewardTermCfg(
+        func=microduck_mdp.posture_height_gaussian,
+        weight=1.0,
+        params={
+            "command_name": "twist",
+            "sit_z": BOW_Z,
+            "stand_z": STAND_Z,
+            "std": 0.04,
+        },
+    )
+    cfg.rewards["posture_height_l1"] = RewardTermCfg(
+        func=microduck_mdp.posture_height_l1,
+        weight=4.0,
+        params={
+            "command_name": "twist",
+            "sit_z": BOW_Z,
+            "stand_z": STAND_Z,
+        },
+    )
+
+    cfg.rewards["posture_pitch"] = RewardTermCfg(
+        func=microduck_mdp.posture_pitch_gaussian,
         weight=3.0,
         params={
-            "target_pitch": TARGET_LEAN,
-            "std": 0.20,  # ~11° of lean-proxy; visible gradient from upright
+            "command_name": "twist",
+            "bow_pitch": TARGET_LEAN,
+            "stand_pitch": 0.0,
+            "std": 0.20,
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
-    cfg.rewards["pitch_bow_sharp"] = RewardTermCfg(
-        func=microduck_mdp.pitch_target_gaussian,
+    cfg.rewards["posture_pitch_sharp"] = RewardTermCfg(
+        func=microduck_mdp.posture_pitch_gaussian,
         weight=2.0,
         params={
-            "target_pitch": TARGET_LEAN,
+            "command_name": "twist",
+            "bow_pitch": TARGET_LEAN,
+            "stand_pitch": 0.0,
             "std": 0.08,
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
-    # Self-negating → POSITIVE weight.
-    cfg.rewards["pitch_bow_l1"] = RewardTermCfg(
-        func=microduck_mdp.pitch_l1_penalty,
+    cfg.rewards["posture_pitch_l1"] = RewardTermCfg(
+        func=microduck_mdp.posture_pitch_l1,
         weight=2.0,
         params={
-            "target_pitch": TARGET_LEAN,
+            "command_name": "twist",
+            "bow_pitch": TARGET_LEAN,
+            "stand_pitch": 0.0,
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
 
-    cfg.rewards["pose_bow_legs"] = RewardTermCfg(
-        func=microduck_mdp.pose_target_match,
+    # Upright only while standing — must not fight the bow lean.
+    cfg.rewards["upright_when_standing"] = RewardTermCfg(
+        func=microduck_mdp.posture_upright_when_standing,
         weight=2.0,
         params={
-            "std": 0.5,
-            "joint_indices": _LEG_JOINTS,
-            "target_overrides": BOWING_TARGET_OVERRIDES,
-        },
-    )
-    cfg.rewards["pose_bow_neck"] = RewardTermCfg(
-        func=microduck_mdp.pose_target_match,
-        weight=0.75,
-        params={
-            "std": 0.4,
-            "joint_indices": _NECK_JOINTS,
-            "target_overrides": BOWING_TARGET_OVERRIDES,
-        },
-    )
-    cfg.rewards["pose_bow_l1"] = RewardTermCfg(
-        func=microduck_mdp.pose_l1_penalty,
-        weight=1.25,
-        params={
-            "joint_indices": _ALL_SERVO,
-            "target_overrides": BOWING_TARGET_OVERRIDES,
-        },
-    )
-
-    cfg.rewards["height_bow"] = RewardTermCfg(
-        func=microduck_mdp.height_target_gaussian,
-        weight=1.0,
-        params={
-            "std": 0.04,
-            "target_height": BOW_Z,
-            "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
-        },
-    )
-    cfg.rewards["height_bow_l1"] = RewardTermCfg(
-        func=microduck_mdp.height_l1_penalty,
-        weight=2.0,
-        params={
-            "target_height": BOW_Z,
+            "command_name": "twist",
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
 
     cfg.rewards["bow_composite"] = RewardTermCfg(
-        func=microduck_mdp.bow_composite_score,
+        func=microduck_mdp.posture_bow_composite,
         weight=3.0,
         params={
-            "target_height": BOW_Z,
-            "target_pitch": TARGET_LEAN,
+            "command_name": "twist",
+            "sit_overrides": BOWING_TARGET_OVERRIDES,
+            "joint_indices": _LEG_JOINTS,
+            "sit_z": BOW_Z,
+            "stand_z": STAND_Z,
+            "bow_pitch": TARGET_LEAN,
+            "stand_pitch": 0.0,
             "height_std": 0.04,
             "pitch_std": 0.20,
             "pose_std": 0.40,
-            "joint_indices": _LEG_JOINTS,
-            "target_overrides": BOWING_TARGET_OVERRIDES,
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
 
-    # Both feet planted — anti-hop / anti-kneel.
+    cfg.rewards["rise_bootstrap"] = RewardTermCfg(
+        func=microduck_mdp.posture_rise_bootstrap,
+        weight=0.75,
+        params={
+            "command_name": "twist",
+            "max_height": 0.125,
+            "max_vz": MAX_RISE_SPEED,
+        },
+    )
+
+    # Self-negating speed/impact penalties → POSITIVE weights.
+    cfg.rewards["descent_speed"] = RewardTermCfg(
+        func=microduck_mdp.trunk_downward_velocity_penalty,
+        weight=8.0,
+        params={
+            "max_down_vel": MAX_DESCENT_SPEED,
+            "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
+        },
+    )
+    cfg.rewards["rise_speed"] = RewardTermCfg(
+        func=microduck_mdp.trunk_upward_velocity_penalty,
+        weight=0.0,  # introduced after the rise is discovered
+        params={
+            "max_up_vel": MAX_RISE_SPEED,
+            "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
+        },
+    )
+    cfg.rewards["gentle_motion"] = RewardTermCfg(
+        func=microduck_mdp.trunk_vertical_accel_penalty,
+        weight=0.02,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
+    )
+
     cfg.rewards["feet_grounded"] = RewardTermCfg(
         func=microduck_mdp.feet_grounded_reward,
         weight=1.0,
         params={"sensor_name": feet_ground_cfg.name},
     )
 
-    # Self-negating |a_z| → POSITIVE weight.
-    cfg.rewards["gentle_motion"] = RewardTermCfg(
-        func=microduck_mdp.trunk_vertical_accel_penalty,
-        weight=0.01,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
-    )
-
-    # ── Sim2real regularisers (velocity parity) ───────────────────────────────
     cfg.rewards["action_rate_l2"].weight = -0.1
     cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
     cfg.rewards["body_ang_vel"].weight = -0.05
@@ -258,7 +300,7 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={"sensor_name": self_collision_cfg.name},
     )
 
-    # ── Observations (61D actor parity) ───────────────────────────────────────
+    # ── Observations ──────────────────────────────────────────────────────────
     del cfg.observations["actor"].terms["base_lin_vel"]
     cfg.observations["critic"].terms["base_lin_vel"] = ObservationTermCfg(
         func=mdp.base_lin_vel, scale=1.0,
@@ -266,7 +308,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     del cfg.observations["critic"].terms["foot_height"]
     del cfg.observations["actor"].terms["height_scan"]
     del cfg.observations["critic"].terms["height_scan"]
-
     for _term, _safe in (
         ("foot_contact_forces", microduck_mdp.foot_contact_forces_safe),
         ("foot_air_time", microduck_mdp.foot_air_time_safe),
@@ -287,7 +328,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.observations["actor"].terms[gravity_term_name].delay_min_lag = 0
     cfg.observations["actor"].terms[gravity_term_name].delay_max_lag = 1
     cfg.observations["actor"].terms[gravity_term_name].delay_update_period = 64
-
     cfg.observations["actor"].terms["base_ang_vel"].noise = Unoise(n_min=-0.03, n_max=0.03)
     cfg.observations["actor"].terms[gravity_term_name].noise = Unoise(n_min=-0.01, n_max=0.01)
     cfg.observations["actor"].terms["joint_pos"].noise = Unoise(n_min=-0.001, n_max=0.001)
@@ -329,25 +369,28 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             func=microduck_mdp.zero_command_padding, params={"dim": 6},
         )
 
-    # Tiny alive-range twist (obs parity); deployment idle is all-zero.
+    # ── Command: bow/stand flag in twist (SitStandCommand) ────────────────────
     command = cfg.commands["twist"]
     command.rel_standing_envs = 0.0
     command.rel_heading_envs = 0.0
     command.heading_command = False
     command.ranges.heading = None
-    command.resampling_time_range = (EPISODE_LENGTH_S, EPISODE_LENGTH_S * 2)
+    command.resampling_time_range = POSTURE_DWELL_S
     command.debug_vis = False
-    command.ranges.lin_vel_x = (-0.01, 0.01)
-    command.ranges.lin_vel_y = (-0.01, 0.01)
-    command.ranges.ang_vel_z = (-0.05, 0.05)
-    cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
-    # Drop head/body pose commands if the base template installed them — slots
-    # are zero-padded above; keeping live commands would desync obs vs reward.
+    cfg.commands["twist"] = microduck_mdp.SitStandCommandCfg(
+        **{
+            **vars(command),
+            "sit_prob": BOW_PROB,
+            "ramp_s": POSTURE_RAMP_S,
+            "sit_z": BOW_Z,
+            "stand_z": STAND_Z,
+        }
+    )
     cfg.commands.pop("head_pose", None)
     cfg.commands.pop("body_pose", None)
 
-    # fell_over kept: limit ~70° in velocity template — bow at 45° is safe;
-    # real face-plants still terminate.
+    if "fell_over" in cfg.terminations:
+        del cfg.terminations["fell_over"]
     cfg.terminations["nan_state"] = TerminationTermCfg(
         func=microduck_mdp.robot_state_is_nan,
         time_out=False,
@@ -366,6 +409,8 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.events["foot_friction"].params["ranges"] = (0.7, 1.3)
     cfg.events["reset_robot_joints"].params["position_range"] = (-0.05, 0.05)
 
+    # Standing-only resets: bowed spawn needs a pitched freejoint (joints alone
+    # leave the root upright and tip). Mid-episode flag flips train both ways.
     cfg.events["set_ground_state"] = EventTermCfg(
         func=microduck_mdp.set_random_ground_state,
         mode="reset",
@@ -402,7 +447,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 "ranges": (-COM_RANDOMIZATION_RANGE, COM_RANDOMIZATION_RANGE),
             },
         )
-
     if ENABLE_HEAD_COM_RANDOMIZATION:
         cfg.events["randomize_head_com"] = EventTermCfg(
             func=dr.body_ipos,
@@ -413,7 +457,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 "ranges": (-HEAD_COM_RANDOMIZATION_RANGE, HEAD_COM_RANDOMIZATION_RANGE),
             },
         )
-
     if ENABLE_ARMATURE_RANDOMIZATION:
         cfg.events["randomize_armature"] = EventTermCfg(
             func=dr.joint_armature,
@@ -424,7 +467,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 "ranges": ARMATURE_RANDOMIZATION_RANGE,
             },
         )
-
     if ENABLE_KP_RANDOMIZATION or ENABLE_KD_RANDOMIZATION:
         kp_range = KP_RANDOMIZATION_RANGE if ENABLE_KP_RANDOMIZATION else (1.0, 1.0)
         kd_range = KD_RANDOMIZATION_RANGE if ENABLE_KD_RANDOMIZATION else (1.0, 1.0)
@@ -438,7 +480,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 "kd_range": kd_range,
             },
         )
-
     if ENABLE_MASS_INERTIA_RANDOMIZATION:
         _mi_lo, _mi_hi = MASS_INERTIA_RANDOMIZATION_RANGE
         cfg.events["randomize_mass_inertia"] = EventTermCfg(
@@ -449,7 +490,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 "alpha_range": (math.log(_mi_lo) / 2.0, math.log(_mi_hi) / 2.0),
             },
         )
-
     if ENABLE_JOINT_FRICTION_RANDOMIZATION:
         cfg.events["randomize_joint_friction"] = EventTermCfg(
             func=microduck_mdp.randomize_bam_friction,
@@ -462,7 +502,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     cfg.scene.terrain.terrain_type = "plane"
     cfg.scene.terrain.terrain_generator = None
-
     del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 
@@ -480,7 +519,17 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             ],
         },
     )
-
+    cfg.curriculum["rise_speed_weight"] = CurriculumTermCfg(
+        func=microduck_mdp.reward_weight,
+        params={
+            "reward_name": "rise_speed",
+            "weight_stages": [
+                {"step": 0, "weight": 0.0},
+                {"step": 750 * 24, "weight": 5.0},
+                {"step": 1500 * 24, "weight": 8.0},
+            ],
+        },
+    )
     if ENABLE_COM_RANDOMIZATION:
         cfg.curriculum["com_range"] = CurriculumTermCfg(
             func=microduck_mdp.com_range_curriculum,
@@ -494,7 +543,6 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 ],
             },
         )
-
     if ENABLE_HEAD_COM_RANDOMIZATION:
         cfg.curriculum["head_com_range"] = CurriculumTermCfg(
             func=microduck_mdp.com_range_curriculum,
@@ -507,17 +555,15 @@ def make_microduck_bow_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 ],
             },
         )
-
     if ENABLE_VELOCITY_PUSHES:
-        # Delay pushes until the bow motion exists (standup / ball_kick lesson).
         cfg.curriculum["push_magnitude"] = CurriculumTermCfg(
             func=microduck_mdp.push_curriculum,
             params={
                 "event_name": "push_robot",
                 "push_stages": [
                     {"step": 0, "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)}},
-                    {"step": 500 * 24, "velocity_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}},
-                    {"step": 1000 * 24, "velocity_range": {"x": VELOCITY_PUSH_RANGE, "y": VELOCITY_PUSH_RANGE}},
+                    {"step": 750 * 24, "velocity_range": {"x": (-0.08, 0.08), "y": (-0.08, 0.08)}},
+                    {"step": 1500 * 24, "velocity_range": {"x": VELOCITY_PUSH_RANGE, "y": VELOCITY_PUSH_RANGE}},
                 ],
             },
         )

@@ -6817,6 +6817,82 @@ def posture_stillness(
     return torch.exp(-((v / vel_std) ** 2)) * z_gate * tilt_gate * ramp_done
 
 
+def posture_pitch_gaussian(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    bow_pitch: float,
+    stand_pitch: float = 0.0,
+    std: float = 0.15,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gaussian on trunk forward lean vs the slewed stand↔bow pitch target.
+
+    ``projected_gravity_b[:, 0]`` (positive = forward). Stand target ≈ 0;
+    bow target = ``bow_pitch`` (typically ``sin(45°)``).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    blend = _posture_blend(env, command_name)
+    target = stand_pitch + blend * (bow_pitch - stand_pitch)
+    lean = asset.data.projected_gravity_b[:, 0]
+    return torch.exp(-((lean - target) / std) ** 2)
+
+
+def posture_pitch_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    bow_pitch: float,
+    stand_pitch: float = 0.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """L1 companion to ``posture_pitch_gaussian`` (self-negating → +weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    blend = _posture_blend(env, command_name)
+    target = stand_pitch + blend * (bow_pitch - stand_pitch)
+    lean = asset.data.projected_gravity_b[:, 0]
+    return -torch.abs(lean - target)
+
+
+def posture_upright_when_standing(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """``body_upright_linear`` gated by (1 − blend): on at stand, off at bow."""
+    blend = _posture_blend(env, command_name)
+    return body_upright_linear(env, asset_cfg=asset_cfg) * (1.0 - blend)
+
+
+def posture_bow_composite(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    sit_overrides: dict,
+    joint_indices: list,
+    sit_z: float,
+    stand_z: float,
+    bow_pitch: float,
+    stand_pitch: float = 0.0,
+    height_std: float = 0.04,
+    pitch_std: float = 0.20,
+    pose_std: float = 0.40,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Multiplicative stand↔bow goal: height · pitch · pose (no upright)."""
+    asset = env.scene[asset_cfg.name]
+    blend, target = _posture_targets(env, asset, command_name, sit_overrides)
+    target_z, z = _posture_height(env, command_name, sit_z, stand_z)
+    height_score = torch.exp(-((z - target_z) / height_std) ** 2)
+
+    lean_target = stand_pitch + blend * (bow_pitch - stand_pitch)
+    lean = asset.data.projected_gravity_b[:, 0]
+    pitch_score = torch.exp(-((lean - lean_target) / pitch_std) ** 2)
+
+    joint_pos = _servo_joint_pos(env, asset)[:, joint_indices]
+    pose_err_sq = ((joint_pos - target[:, joint_indices]) ** 2).mean(dim=-1)
+    pose_score = torch.exp(-pose_err_sq / (pose_std * pose_std))
+
+    return height_score * pitch_score * pose_score
+
+
 def posture_rise_bootstrap(
     env: ManagerBasedRlEnv,
     command_name: str,

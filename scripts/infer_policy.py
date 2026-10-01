@@ -215,7 +215,7 @@ class PolicyInference:
                  standing_onnx_path=None, switch_threshold=0.05,
                  use_projected_gravity=False, ground_pick_onnx_path=None, ground_pick_period=4.0,
                  sit_onnx_path=None, new_cmd_obs=False, slope_onnx_path=None,
-                 sitstand_onnx_path=None,
+                 sitstand_onnx_path=None, bow_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
                  kick_duration=3.0, roulade_duration=2.0):
@@ -285,8 +285,10 @@ class PolicyInference:
         self.sit_session = None
         self.sit_mode = False
         self.is_sitstand = False
-        if sit_onnx_path and sitstand_onnx_path:
-            raise ValueError("Provide only one of --sit / --sitstand")
+        self.is_bow = False
+        n_posture = sum(p is not None for p in (sit_onnx_path, sitstand_onnx_path, bow_onnx_path))
+        if n_posture > 1:
+            raise ValueError("Provide only one of --sit / --sitstand / --bow")
         if sit_onnx_path:
             print(f"\nLoading sit policy from: {sit_onnx_path}")
             self.sit_session = ort.InferenceSession(sit_onnx_path)
@@ -302,6 +304,17 @@ class PolicyInference:
             self.is_sitstand = True
             ss_input_shape = self.sit_session.get_inputs()[0].shape
             print(f"Sitstand policy input shape: {ss_input_shape}")
+        elif bow_onnx_path:
+            if not self.new_cmd_obs:
+                raise ValueError(
+                    "--bow policies use the unified 13D command obs (61D); run with --new-cmd-obs"
+                )
+            print(f"\nLoading bow policy from: {bow_onnx_path}")
+            self.sit_session = ort.InferenceSession(bow_onnx_path)
+            self.is_sitstand = True  # same cmd[0] posture-flag protocol
+            self.is_bow = True
+            bb_input_shape = self.sit_session.get_inputs()[0].shape
+            print(f"Bow policy input shape: {bb_input_shape}")
 
         # Load slope policy (passive descent, runs with zero twist command)
         self.slope_session = None
@@ -342,7 +355,7 @@ class PolicyInference:
         # Validate at least one policy loaded. A sitstand policy can run alone
         # (it holds the stand at flag=0), unlike the old one-way sit policy.
         if not self.walking_session and not self.standing_session and not self.is_sitstand:
-            raise ValueError("At least one of --walking, --standing or --sitstand must be provided")
+            raise ValueError("At least one of --walking, --standing, --sitstand or --bow must be provided")
 
         # Determine initial active session and policy
         if self.walking_session:
@@ -817,32 +830,31 @@ class PolicyInference:
         walking/standing as usual.
         """
         if self.sit_session is None:
-            print("Sit unavailable: no --sit/--sitstand policy loaded")
+            print("Sit/Bow unavailable: no --sit/--sitstand/--bow policy loaded")
             return
         if self.ground_pick_mode:
-            print("Cannot sit during ground pick")
+            print("Cannot sit/bow during ground pick")
             return
         if self.behavior_mode is not None:
-            print(f"Cannot sit during {self.behavior_mode}")
+            print(f"Cannot sit/bow during {self.behavior_mode}")
             return
         self.sit_mode = not self.sit_mode
+        label = "Bow" if self.is_bow else "Sit"
         if self.sit_mode:
             self.vel_cmd = np.zeros(3, dtype=np.float32)
             self.current_policy = "sit"
             self.ort_session = self.sit_session
-            print("Sit: ON" + (" (sitstand flag=1; Y again to stand up)" if self.is_sitstand else ""))
+            print(f"{label}: ON" + (" (flag=1; Y again to stand up)" if self.is_sitstand else ""))
         elif self.is_sitstand:
-            # Stay on the sitstand session — it stands up itself (flag → 0).
-            # Do NOT swap to the standing policy here: it would take over
-            # mid-rise from a seated state it wasn't trained on.
-            print("Sit: OFF → sitstand policy standing up (flag=0)")
+            # Stay on the same session — it stands up itself (flag → 0).
+            print(f"{label}: OFF → policy standing up (flag=0)")
         else:
             if self.standing_session:
                 self.current_policy = "standing"
             else:
                 self.current_policy = "walking"
             self.ort_session = self.standing_session if self.current_policy == "standing" else self.walking_session
-            print(f"Sit: OFF → back to {self.current_policy}")
+            print(f"{label}: OFF → back to {self.current_policy}")
         self._update_command()
 
     def toggle_head_mode(self):
@@ -1176,6 +1188,7 @@ def main():
     parser.add_argument("--ground-pick", type=str, default=None, help="Path to ground pick policy ONNX file (press G to activate)")
     parser.add_argument("--sit", type=str, default=None, help="Path to OLD one-way sitting policy ONNX file (press Y to sit, Y again switches back to standing/walking policy)")
     parser.add_argument("--sitstand", type=str, default=None, help="Path to sitstand policy ONNX (commanded sit<->stand; press Y to sit, Y again the SAME policy stands back up). Requires --new-cmd-obs. Can run standalone.")
+    parser.add_argument("--bow", type=str, default=None, help="Path to bow policy ONNX (commanded stand<->bow; press Y to bow, Y again to stand up). Requires --new-cmd-obs. Can run standalone.")
     parser.add_argument("--slope", type=str, default=None, help="Path to slope policy ONNX file (press Y to toggle)")
     parser.add_argument("--kick-left", type=str, default=None, help="Path to LEFT-foot ball kick policy ONNX (press K to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--kick-right", type=str, default=None, help="Path to RIGHT-foot ball kick policy ONNX (press L to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
@@ -1232,10 +1245,14 @@ def main():
                              "compare drift; combine with --odom-anchor-points to see each anchor.")
     args = parser.parse_args()
 
-    if not args.walking and not args.standing and not args.sitstand:
-        parser.error("At least one of --walking, --standing or --sitstand must be provided")
+    if not args.walking and not args.standing and not args.sitstand and not args.bow:
+        parser.error("At least one of --walking, --standing, --sitstand or --bow must be provided")
     if args.sitstand and not args.new_cmd_obs:
         parser.error("--sitstand policies use the unified 13D command obs (61D); add --new-cmd-obs")
+    if args.bow and not args.new_cmd_obs:
+        parser.error("--bow policies use the unified 13D command obs (61D); add --new-cmd-obs")
+    if sum(x is not None for x in (args.sit, args.sitstand, args.bow)) > 1:
+        parser.error("Provide only one of --sit / --sitstand / --bow")
     if (args.kick_left or args.kick_right or args.roulade) and not args.new_cmd_obs:
         parser.error("--kick-left/--kick-right/--roulade policies use the unified 13D command obs (61D); add --new-cmd-obs")
     if (args.kick_left or args.kick_right or args.roulade) and args.roller:
@@ -1337,6 +1354,7 @@ def main():
         new_cmd_obs=args.new_cmd_obs,
         slope_onnx_path=args.slope,
         sitstand_onnx_path=args.sitstand,
+        bow_onnx_path=args.bow,
         kick_left_onnx_path=args.kick_left,
         kick_right_onnx_path=args.kick_right,
         roulade_onnx_path=args.roulade,
@@ -1417,7 +1435,7 @@ def main():
     if policy.ground_pick_session:
         print(f"Ground pick policy: loaded  (press G)")
     if policy.sit_session:
-        kind = "Sitstand" if policy.is_sitstand else "Sit"
+        kind = "Bow" if policy.is_bow else ("Sitstand" if policy.is_sitstand else "Sit")
         print(f"{kind} policy: loaded  (press Y to toggle)")
     if policy.slope_session:
         print(f"Slope policy: loaded  (press Y to toggle, passive descent)")
@@ -1620,7 +1638,7 @@ def main():
     print("  SPACE:            coast (zero all commands)")
     print("  T:                toggle policy inference on/off (paused = motors hold last target)")
     print("  G:                trigger ground pick (requires --ground-pick)")
-    print("  Y:                toggle sit (with --sit/--sitstand) or slope mode (with --slope)")
+    print("  Y:                toggle sit/bow (with --sit/--sitstand/--bow) or slope mode (with --slope)")
     print("  K:                kick with LEFT foot (requires --kick-left)")
     print("  L:                kick with RIGHT foot (requires --kick-right)")
     print("  R:                roulade / forward roll (requires --roulade)")
