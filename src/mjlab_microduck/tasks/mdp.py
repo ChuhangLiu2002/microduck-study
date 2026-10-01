@@ -995,6 +995,72 @@ def standing_composite_score(
     return height_score * upright_score * pose_score
 
 
+def pitch_target_gaussian(
+    env: ManagerBasedRlEnv,
+    target_pitch: float,
+    std: float = 0.15,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gaussian on trunk forward lean vs a fixed target.
+
+    Proxy: ``projected_gravity_b[:, 0]`` (positive = forward lean; verified in
+    crouch_forward_lean / roller forward_lean). ``target_pitch = sin(θ)`` for
+    a desired trunk pitch θ (e.g. sin(45°) ≈ 0.707 for a bow).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    lean = asset.data.projected_gravity_b[:, 0]
+    return torch.exp(-((lean - target_pitch) / std) ** 2)
+
+
+def pitch_l1_penalty(
+    env: ManagerBasedRlEnv,
+    target_pitch: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """L1 companion to ``pitch_target_gaussian`` (self-negating → positive weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    lean = asset.data.projected_gravity_b[:, 0]
+    return -torch.abs(lean - target_pitch)
+
+
+def bow_composite_score(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    target_pitch: float,
+    height_std: float,
+    pitch_std: float,
+    pose_std: float,
+    joint_indices: list,
+    target_overrides: Optional[dict] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Multiplicative goal score for a pitched bow: height · pitch · pose.
+
+    Same anti-compromise product as ``standing_composite_score``, but the
+    orientation factor tracks a FORWARD lean target instead of upright.
+    """
+    asset = env.scene[asset_cfg.name]
+
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    height_score = torch.exp(-((z - target_height) / height_std) ** 2)
+
+    lean = asset.data.projected_gravity_b[:, 0]
+    pitch_score = torch.exp(-((lean - target_pitch) / pitch_std) ** 2)
+
+    target = _servo_default_joint_pos(env, asset).clone()
+    if target_overrides:
+        for idx, val in target_overrides.items():
+            target[:, idx] = val
+    joint_pos = _servo_joint_pos(env, asset)[:, joint_indices]
+    target = target[:, joint_indices]
+    pose_err_sq = ((joint_pos - target) ** 2).mean(dim=-1)
+    pose_score = torch.exp(-pose_err_sq / (pose_std * pose_std))
+
+    return height_score * pitch_score * pose_score
+
+
 def standing_success_bonus(
     env: ManagerBasedRlEnv,
     target_height: float,
