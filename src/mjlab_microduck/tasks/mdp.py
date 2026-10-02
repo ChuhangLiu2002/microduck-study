@@ -7531,3 +7531,144 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Dance — 8 s phase routine with piecewise velocity + multi-keyframe pose
+# ---------------------------------------------------------------------------
+
+# Phase knots matching microduck_dance_env_cfg (period = 8 s).
+DANCE_VEL_SEGMENTS: tuple[tuple[float, float, tuple[float, float, float]], ...] = (
+    # (lo, hi, (vx, vy, ωz))
+    (0.00, 0.10, (0.0, 0.0, 0.0)),
+    (0.10, 0.30, (0.08, 0.0, 0.0)),
+    (0.30, 0.50, (0.0, 0.06, 0.0)),
+    (0.50, 0.70, (0.0, -0.06, 0.0)),
+    (0.70, 0.85, (-0.06, 0.0, 0.3)),
+    (0.85, 1.00, (0.0, 0.0, 0.0)),
+)
+
+
+def dance_velocity_target(phase: torch.Tensor) -> torch.Tensor:
+    """Piecewise-constant body-frame velocity target for the dance phase.
+
+    ``phase`` (B,) in [0, 1). Returns (B, 3) = (vx, vy, ωz).
+    """
+    vx = torch.zeros_like(phase)
+    vy = torch.zeros_like(phase)
+    wz = torch.zeros_like(phase)
+    for lo, hi, (tx, ty, tz) in DANCE_VEL_SEGMENTS:
+        mask = (phase >= lo) & (phase < hi) if hi < 1.0 else (phase >= lo) & (phase <= 1.0)
+        if tx != 0.0:
+            vx = torch.where(mask, torch.full_like(phase, tx), vx)
+        if ty != 0.0:
+            vy = torch.where(mask, torch.full_like(phase, ty), vy)
+        if tz != 0.0:
+            wz = torch.where(mask, torch.full_like(phase, tz), wz)
+    return torch.stack([vx, vy, wz], dim=-1)
+
+
+def dance_pose_target(
+    phase: torch.Tensor,
+    knot_phases: list[float] | tuple[float, ...],
+    knot_poses: list[torch.Tensor] | tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """Piecewise-linear joint target across named keyframe knots.
+
+    ``phase`` (B,) in [0, 1). Each ``knot_poses[i]`` is (k,) absolute joint
+    angles at ``knot_phases[i]``. Returns (B, k).
+    """
+    if len(knot_phases) != len(knot_poses) or len(knot_phases) < 2:
+        raise ValueError("dance_pose_target needs ≥2 matching knot_phases / knot_poses")
+    p = phase.unsqueeze(-1)  # (B,1)
+    # Default: hold first keyframe
+    out = knot_poses[0].unsqueeze(0).expand(phase.shape[0], -1).clone()
+    for i in range(len(knot_phases) - 1):
+        lo, hi = float(knot_phases[i]), float(knot_phases[i + 1])
+        span = max(hi - lo, 1e-8)
+        s = ((p - lo) / span).clamp(0.0, 1.0)
+        seg = knot_poses[i] + s * (knot_poses[i + 1] - knot_poses[i])
+        out = torch.where(p >= lo, seg, out)
+    return out
+
+
+def _dance_phase_from_command(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    cmd = env.command_manager.get_command(command_name)
+    return (torch.atan2(cmd[:, 1], cmd[:, 0]) / (2 * torch.pi)) % 1.0
+
+
+def _dance_pose_error(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str,
+    knot_phases: list[float],
+    knot_poses: list[dict],
+    joint_names: Optional[list] = None,
+):
+    """(cur, target) for multi-keyframe dance pose; joints resolved by name."""
+    if not knot_poses:
+        raise ValueError("_dance_pose_error requires non-empty knot_poses")
+    asset: Entity = env.scene[asset_cfg.name]
+    names = list(joint_names) if joint_names is not None else list(knot_poses[0].keys())
+    ids = [int(asset.find_joints([n])[0][0]) for n in names]
+
+    def vec(d: dict) -> torch.Tensor:
+        return torch.tensor(
+            [d[n] for n in names], device=env.device, dtype=asset.data.joint_pos.dtype
+        )
+
+    knots = [vec(d) for d in knot_poses]
+    phase = _dance_phase_from_command(env, command_name)
+    target = dance_pose_target(phase, knot_phases, knots)
+    cur = asset.data.joint_pos[:, ids]
+    return cur, target
+
+
+def dance_pose_track(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    knot_phases: Optional[list] = None,
+    knot_poses: Optional[list] = None,
+    std: float = 0.4,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    joint_names: Optional[list] = None,
+) -> torch.Tensor:
+    """Gaussian match to the phase-interpolated dance joint target."""
+    cur, target = _dance_pose_error(
+        env, asset_cfg, command_name, knot_phases or [], knot_poses or [], joint_names
+    )
+    return torch.exp(-((cur - target) / std) ** 2).mean(dim=-1)
+
+
+def dance_pose_track_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    knot_phases: Optional[list] = None,
+    knot_poses: Optional[list] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    joint_names: Optional[list] = None,
+) -> torch.Tensor:
+    """L1 companion to ``dance_pose_track`` (self-negating → +weight)."""
+    cur, target = _dance_pose_error(
+        env, asset_cfg, command_name, knot_phases or [], knot_poses or [], joint_names
+    )
+    return -(cur - target).abs().mean(dim=-1)
+
+
+def dance_vel_track_gaussian(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std_lin: float = 0.08,
+    std_ang: float = 0.25,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gaussian on body-frame (vx, vy, ωz) vs ``dance_velocity_target(phase)``."""
+    asset: Entity = env.scene[asset_cfg.name]
+    phase = _dance_phase_from_command(env, command_name)
+    target = dance_velocity_target(phase)  # (B,3)
+    lin = asset.data.root_link_lin_vel_b[:, :2]
+    ang = asset.data.root_link_ang_vel_b[:, 2]
+    e_lin = ((lin - target[:, :2]) / std_lin) ** 2
+    e_ang = ((ang - target[:, 2]) / std_ang) ** 2
+    err = e_lin.mean(dim=-1) + e_ang
+    return torch.exp(-torch.nan_to_num(err, nan=0.0))

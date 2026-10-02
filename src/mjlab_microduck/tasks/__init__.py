@@ -47,6 +47,10 @@ from .microduck_bow_env_cfg import (
     make_microduck_bow_env_cfg,
     MicroduckBowRlCfg,
 )
+from .microduck_dance_env_cfg import (
+    make_microduck_dance_env_cfg,
+    MicroduckDanceRlCfg,
+)
 from .microduck_sitstand_env_cfg import (
     make_microduck_sitstand_env_cfg,
     MicroduckSitStandRlCfg,
@@ -155,6 +159,15 @@ register_mjlab_task(
     env_cfg=make_microduck_bow_env_cfg(),
     play_env_cfg=make_microduck_bow_env_cfg(play=True),
     rl_cfg=MicroduckBowRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Dance — 8 s episodic groove with locomotion; D in infer_policy
+register_mjlab_task(
+    task_id="Mjlab-Dance-Flat-MicroDuck",
+    env_cfg=make_microduck_dance_env_cfg(),
+    play_env_cfg=make_microduck_dance_env_cfg(play=True),
+    rl_cfg=MicroduckDanceRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
@@ -279,6 +292,7 @@ _BACKLASH_TASKS = (
     ("Mjlab-GroundPick-Rough-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {"rough": True}, MicroduckGroundPickRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-BallKick-Flat-Backlash-MicroDuck", make_microduck_ball_kick_env_cfg, {}, MicroduckBallKickRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-Bow-Flat-Backlash-MicroDuck", make_microduck_bow_env_cfg, {}, MicroduckBowRlCfg, _BL_WALK),
+    ("Mjlab-Dance-Flat-Backlash-MicroDuck", make_microduck_dance_env_cfg, {}, MicroduckDanceRlCfg, _BL_WALK),
     ("Mjlab-Velocity-Flat-Backlash-MicroDuck-Rollers", make_microduck_velocity_rollers_env_cfg, {}, MicroduckRollersRlCfg, _BL_ROLLERS),
     ("Mjlab-Velocity-Swizzle-Backlash-MicroDuck", make_microduck_velocity_swizzle_env_cfg, {}, MicroduckSwizzleRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerCrouch-Flat-Backlash-MicroDuck", make_microduck_roller_crouch_env_cfg, {}, MicroduckRollerCrouchRlCfg, _BL_ROLLERS),

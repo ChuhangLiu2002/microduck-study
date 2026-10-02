@@ -217,7 +217,7 @@ class PolicyInference:
                  sit_onnx_path=None, new_cmd_obs=False, slope_onnx_path=None,
                  sitstand_onnx_path=None, bow_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
-                 roulade_onnx_path=None,
+                 roulade_onnx_path=None, dance_onnx_path=None, dance_period=8.0,
                  kick_duration=3.0, roulade_duration=2.0):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
@@ -274,6 +274,16 @@ class PolicyInference:
             self.ground_pick_session = ort.InferenceSession(ground_pick_onnx_path)
             gp_input_shape = self.ground_pick_session.get_inputs()[0].shape
             print(f"Ground pick policy input shape: {gp_input_shape}")
+
+        # Dance — same phase protocol as ground_pick, full 0→1 cycle then return.
+        self.dance_session = None
+        self.dance_mode = False
+        self.dance_phase = 0.0
+        self.dance_period = dance_period
+        if dance_onnx_path:
+            print(f"\nLoading dance policy from: {dance_onnx_path}")
+            self.dance_session = ort.InferenceSession(dance_onnx_path)
+            print(f"Dance policy input shape: {self.dance_session.get_inputs()[0].shape}")
 
         # Load sit policy. Two flavours share the Y key and self.sit_session:
         #  - --sit (is_sitstand=False): the OLD one-way sit policy. Sits
@@ -355,7 +365,9 @@ class PolicyInference:
         # Validate at least one policy loaded. A sitstand policy can run alone
         # (it holds the stand at flag=0), unlike the old one-way sit policy.
         if not self.walking_session and not self.standing_session and not self.is_sitstand:
-            raise ValueError("At least one of --walking, --standing, --sitstand or --bow must be provided")
+            raise ValueError(
+                "At least one of --walking, --standing, --sitstand or --bow must be provided"
+            )
 
         # Determine initial active session and policy
         if self.walking_session:
@@ -491,6 +503,9 @@ class PolicyInference:
                 # head/body commands would be out-of-distribution.
                 self.command = np.zeros(13, dtype=np.float32)
                 return
+            if self.dance_mode or self.ground_pick_mode:
+                # Phase encoding owns twist[0:3]; don't clobber mid-cycle.
+                return
             cmd = np.zeros(13, dtype=np.float32)
             # twist slot (or phase encoding for ground_pick — overwritten there)
             if self.current_policy == "walking":
@@ -500,8 +515,7 @@ class PolicyInference:
                 # all-zero twist is the STAND command for this policy, which is
                 # why feeding it the old sit-policy zero command did nothing.
                 cmd[0] = 1.0 if self.sit_mode else 0.0
-            # else standing/old-sit/ground_pick: leave twist 0 (ground_pick
-            # writes its phase encoding later)
+            # else standing/old-sit: leave twist 0
             cmd[3:7]  = self.head_offset
             cmd[7:13] = self.body_cmd  # [x, y, z, roll, pitch, yaw]
             self.command = cmd
@@ -531,6 +545,8 @@ class PolicyInference:
             return  # Only one policy loaded, no switching
         if self.ground_pick_mode:
             return  # Don't switch during ground pick
+        if self.dance_mode:
+            return  # Don't switch during dance
         if self.sit_mode:
             return  # Don't switch while sitting
         if self.slope_mode:
@@ -575,6 +591,9 @@ class PolicyInference:
             return
         if self.behavior_mode is not None:
             print(f"Cannot toggle slope mode during {self.behavior_mode}")
+            return
+        if self.dance_mode:
+            print("Cannot toggle slope mode during dance")
             return
         self.slope_mode = not self.slope_mode
         if self.slope_mode:
@@ -702,6 +721,9 @@ class PolicyInference:
         if self.ground_pick_mode:
             print("Ground pick already in progress")
             return
+        if self.dance_mode:
+            print("Cannot ground pick during dance")
+            return
         if self.sit_mode:
             print("Cannot ground pick while sitting (press Y to stand up first)")
             return
@@ -742,6 +764,64 @@ class PolicyInference:
         self.command[1] = np.sin(2 * np.pi * self.ground_pick_phase)
         self.command[2] = 0.0
 
+    def trigger_dance(self):
+        """Start one 8 s dance cycle from φ=0; returns to walking/standing at φ≥1."""
+        if self.dance_session is None:
+            print("Dance unavailable: no --dance policy loaded")
+            return
+        if self.dance_mode:
+            print("Dance already in progress")
+            return
+        if self.ground_pick_mode:
+            print("Cannot dance during ground pick")
+            return
+        if self.sit_mode:
+            print("Cannot dance while sitting (press Y to stand up first)")
+            return
+        if self.behavior_mode is not None:
+            print(f"Cannot dance during {self.behavior_mode}")
+            return
+        if self.slope_mode:
+            print("Cannot dance during slope mode")
+            return
+        self.dance_mode = True
+        self.dance_phase = 0.0
+        self.vel_cmd = np.zeros(3, dtype=np.float32)
+        self.ort_session = self.dance_session
+        self.current_policy = "dance"
+        self.command[0] = 1.0
+        self.command[1] = 0.0
+        self.command[2] = 0.0
+        print(f"Dance: started (period={self.dance_period:.1f}s)")
+
+    def _end_dance(self):
+        self.dance_mode = False
+        self.vel_cmd = np.zeros(3, dtype=np.float32)
+        if self.walking_session:
+            self.current_policy = "walking"
+            self.ort_session = self.walking_session
+        elif self.standing_session:
+            self.current_policy = "standing"
+            self.ort_session = self.standing_session
+        else:
+            self.current_policy = "sit"
+            self.ort_session = self.sit_session
+        self._update_command()
+        print(f"Dance: done → back to {self.current_policy}")
+
+    def update_dance_phase(self, dt: float):
+        """Advance dance phase; hand back only after a full φ∈[0,1) cycle."""
+        if not self.dance_mode:
+            return
+        new_phase = self.dance_phase + dt / self.dance_period
+        if new_phase >= 1.0:
+            self._end_dance()
+            return
+        self.dance_phase = new_phase
+        self.command[0] = np.cos(2 * np.pi * self.dance_phase)
+        self.command[1] = np.sin(2 * np.pi * self.dance_phase)
+        self.command[2] = 0.0
+
     def trigger_behavior(self, name):
         """Start an episodic behavior (kick_left / kick_right / roulade).
 
@@ -758,6 +838,9 @@ class PolicyInference:
             return
         if self.ground_pick_mode:
             print(f"Cannot start {name} during ground pick")
+            return
+        if self.dance_mode:
+            print(f"Cannot start {name} during dance")
             return
         if self.sit_mode:
             print(f"Cannot start {name} while sitting (press Y to stand up first)")
@@ -834,6 +917,9 @@ class PolicyInference:
             return
         if self.ground_pick_mode:
             print("Cannot sit/bow during ground pick")
+            return
+        if self.dance_mode:
+            print("Cannot sit/bow during dance")
             return
         if self.behavior_mode is not None:
             print(f"Cannot sit/bow during {self.behavior_mode}")
@@ -1186,6 +1272,8 @@ def main():
     parser.add_argument("--walking", type=str, default=None, help="Path to walking policy ONNX file")
     parser.add_argument("--standing", "-s", type=str, default=None, help="Path to standing policy ONNX file")
     parser.add_argument("--ground-pick", type=str, default=None, help="Path to ground pick policy ONNX file (press G to activate)")
+    parser.add_argument("--dance", type=str, default=None, help="Path to dance policy ONNX (press D; 8 s phase cycle then auto-return). Requires walking/standing for handback.")
+    parser.add_argument("--dance-period", type=float, default=8.0, help="Dance phase period in seconds (default: 8.0)")
     parser.add_argument("--sit", type=str, default=None, help="Path to OLD one-way sitting policy ONNX file (press Y to sit, Y again switches back to standing/walking policy)")
     parser.add_argument("--sitstand", type=str, default=None, help="Path to sitstand policy ONNX (commanded sit<->stand; press Y to sit, Y again the SAME policy stands back up). Requires --new-cmd-obs. Can run standalone.")
     parser.add_argument("--bow", type=str, default=None, help="Path to bow policy ONNX (commanded stand<->bow; press Y to bow, Y again to stand up). Requires --new-cmd-obs. Can run standalone.")
@@ -1350,6 +1438,8 @@ def main():
         use_projected_gravity=not args.raw_accelerometer,
         ground_pick_onnx_path=args.ground_pick,
         ground_pick_period=args.ground_pick_period,
+        dance_onnx_path=args.dance,
+        dance_period=args.dance_period,
         sit_onnx_path=args.sit,
         new_cmd_obs=args.new_cmd_obs,
         slope_onnx_path=args.slope,
@@ -1434,6 +1524,8 @@ def main():
         print(f"  Switch threshold: {policy.switch_threshold} (vel cmd magnitude)")
     if policy.ground_pick_session:
         print(f"Ground pick policy: loaded  (press G)")
+    if policy.dance_session:
+        print(f"Dance policy: loaded  (press D, period={policy.dance_period:.1f}s)")
     if policy.sit_session:
         kind = "Bow" if policy.is_bow else ("Sitstand" if policy.is_sitstand else "Sit")
         print(f"{kind} policy: loaded  (press Y to toggle)")
@@ -1569,6 +1661,8 @@ def main():
                 print(f"Policy inference: {'ON' if policy_enabled else 'OFF (paused)'}")
             elif key == "g":
                 policy.trigger_ground_pick()
+            elif key == "d":
+                policy.trigger_dance()
             elif key == "k":
                 policy.trigger_behavior("kick_left")
             elif key == "l":
@@ -1638,6 +1732,7 @@ def main():
     print("  SPACE:            coast (zero all commands)")
     print("  T:                toggle policy inference on/off (paused = motors hold last target)")
     print("  G:                trigger ground pick (requires --ground-pick)")
+    print("  D:                trigger dance (requires --dance; 8 s then auto-return)")
     print("  Y:                toggle sit/bow (with --sit/--sitstand/--bow) or slope mode (with --slope)")
     print("  K:                kick with LEFT foot (requires --kick-left)")
     print("  L:                kick with RIGHT foot (requires --kick-right)")
@@ -1695,6 +1790,7 @@ def main():
                 prev_step_time = step_start
 
                 policy.update_ground_pick_phase(actual_dt)
+                policy.update_dance_phase(actual_dt)
                 policy.update_behavior(actual_dt)
 
                 if policy_enabled:
